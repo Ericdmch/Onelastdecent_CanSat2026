@@ -5,13 +5,11 @@
 // Radio      : E220-900T30D via UART0 (TX=GP0, RX=GP1, M0=GP2, M1=GP3, AUX=GP6)
 // FC Link    : MicoAir743V2 (ArduPilot) via UART1 (TX=GP8, RX=GP9)
 // NeoPixel   : WS2812B via PIO (DIN=GP7)
-// Battery    : 1S LiPo via 10k:10k divider on GP26 (ADC0)
 //
 
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "hardware/i2c.h"
-#include "hardware/adc.h"
 #include "hardware/watchdog.h"
 #include "hardware/clocks.h"
 
@@ -24,9 +22,8 @@
 #include <cstring>
 
 // ── Pin assignments ────────────────────────────────────────────────────────
-static constexpr uint I2C0_SDA   = 4;
-static constexpr uint I2C0_SCL   = 5;
-static constexpr uint BATT_ADC_PIN = 26; // ADC0 — 10k:10k divider from LiPo+
+static constexpr uint I2C0_SDA = 4;
+static constexpr uint I2C0_SCL = 5;
 
 // ── Calibration ────────────────────────────────────────────────────────────
 static constexpr float TEMP_OFFSET_C = -6.51f; // corrects for PCB self-heating
@@ -49,12 +46,11 @@ static void led_blink(uint n) {
 }
 
 // Build CSV telemetry packet into buf; returns number of chars written
-// Format: $CANSAT,<ms>,<temp>,<press>,<hum>,<gas>,<lat_e7>,<lon_e7>,<alt_mm>,<roll_deg>,<pitch_deg>,<yaw_deg>,<vbatt>\r\n
+// Format: $CANSAT,<ms>,<temp>,<press>,<hum>,<gas>,<lat_e7>,<lon_e7>,<alt_mm>,<roll_deg>,<pitch_deg>,<yaw_deg>\r\n
 static int build_packet(char* buf, size_t bufsz,
                         uint32_t timestamp_ms,
                         const BME680Data& env,
-                        const FCData& fc_d,
-                        float vbatt)
+                        const FCData& fc_d)
 {
     const float R2D = 57.2957795f;
 
@@ -62,8 +58,7 @@ static int build_packet(char* buf, size_t bufsz,
         "$CANSAT,%lu,"
         "%.2f,%.2f,%.2f,%.0f,"
         "%ld,%ld,%ld,"
-        "%.1f,%.1f,%.1f,"
-        "%.2f"
+        "%.1f,%.1f,%.1f"
         "\r\n",
         (unsigned long)timestamp_ms,
         // BME680
@@ -78,9 +73,7 @@ static int build_packet(char* buf, size_t bufsz,
         // Attitude (convert rad→deg)
         fc_d.att_valid ? fc_d.roll  * R2D : 0.0f,
         fc_d.att_valid ? fc_d.pitch * R2D : 0.0f,
-        fc_d.att_valid ? fc_d.yaw   * R2D : 0.0f,
-        // Battery
-        vbatt
+        fc_d.att_valid ? fc_d.yaw   * R2D : 0.0f
     );
     return n;
 }
@@ -89,6 +82,7 @@ static int build_packet(char* buf, size_t bufsz,
 int main() {
     // --- USB stdio for debug output (UART0 reserved for E220)
     stdio_init_all();
+    sleep_ms(2000); // allow time to open serial monitor before config output begins
 
     // --- CYW43 (required for onboard LED on Pico W)
     cyw43_arch_init();
@@ -96,16 +90,9 @@ int main() {
     // --- NeoPixel
     neopixel_init();
 
-    // --- Watchdog: enable early — will be fed in the main loop
     if (watchdog_caused_reboot()) {
         printf("[BOOT] Watchdog reboot detected\n");
     }
-    watchdog_enable(WATCHDOG_MS, true /*pause on debug*/);
-
-    // --- ADC for battery monitoring (GP26 = ADC0, 10k:10k divider)
-    adc_init();
-    adc_gpio_init(BATT_ADC_PIN);
-    adc_select_input(0);
 
     // --- I2C0 for BME680 (400 kHz)
     i2c_init(i2c0, 400 * 1000);
@@ -132,6 +119,9 @@ int main() {
 
     printf("[OK] System ready. Starting 1Hz loop.\n");
 
+    // --- Watchdog: enable after all init — radio.init() alone can take >2s
+    watchdog_enable(WATCHDOG_MS, true /*pause on debug*/);
+
     // ── Main loop (1 Hz) ───────────────────────────────────────────────────
     while (true) {
         absolute_time_t loop_start = get_absolute_time();
@@ -153,14 +143,10 @@ int main() {
 
         watchdog_update(); // pet after the blocking sensor read
 
-        // 4. Read battery voltage (10k:10k divider → multiply ADC voltage by 2)
-        adc_select_input(0);
-        float vbatt = (adc_read() * 3.3f / 4095.0f) * 2.0f;
-
-        // 5. Build telemetry string
-        char packet[192];
+        // 4. Build telemetry string
+        char packet[160];
         uint32_t ts = to_ms_since_boot(get_absolute_time());
-        int plen = build_packet(packet, sizeof(packet), ts, env, fc.data(), vbatt);
+        int plen = build_packet(packet, sizeof(packet), ts, env, fc.data());
 
         // 6. Print to USB (debug)
         printf("%s", packet);

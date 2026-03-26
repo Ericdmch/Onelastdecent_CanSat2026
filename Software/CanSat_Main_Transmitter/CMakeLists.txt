@@ -56,7 +56,6 @@ target_link_libraries(CanSat_Main_Transmitter
     hardware_watchdog
     hardware_clocks
     hardware_gpio
-    hardware_adc
     pico_cyw43_arch_none
     hardware_pio
 )
