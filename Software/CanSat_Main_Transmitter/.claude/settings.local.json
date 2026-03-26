@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake .. -DPICO_SDK_PATH=$HOME/.pico-sdk/sdk/2.2.0)",
+      "Bash(ninja)",
+      "Bash(ls /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026/Software/CanSat_Main_Transmitter/build/*.uf2)"
+    ]
+  }
+}
