@@ -14,7 +14,15 @@
       "Bash(curl -sL \"https://raw.githubusercontent.com/xreef/EByte_LoRa_E220_Series_Library/master/EByte_LoRa_E220_library.h\" -o /tmp/EByte_LoRa_E220_library.h)",
       "Bash(curl -sL \"https://api.github.com/repos/xreef/EByte_LoRa_E220_Series_Library/contents/includes\")",
       "Bash(python3 -c \"import sys,json; [print\\(f[''''name''''], f[''''download_url'''']\\) for f in json.loads\\(sys.stdin.read\\(\\)\\)]\")",
-      "Bash(curl -sL \"https://raw.githubusercontent.com/xreef/EByte_LoRa_E220_Series_Library/master/includes/statesNaming.h\" -o /tmp/statesNaming.h)"
+      "Bash(curl -sL \"https://raw.githubusercontent.com/xreef/EByte_LoRa_E220_Series_Library/master/includes/statesNaming.h\" -o /tmp/statesNaming.h)",
+      "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026 -type f \\\\\\(-name *.html -o -name *.css -o -name *.js -o -name *dashboard* -o -name *ui* -o -name *interface* \\\\\\))",
+      "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026/Software -type f -name *.py)",
+      "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026/Software/CanSat_Main_Reciever -type f \\\\\\(-name *.py -o -name *.html -o -name *.css -o -name *.js \\\\\\))",
+      "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026/Software/CanSat_Main_Transmitter -type f \\\\\\(-name *.py -o -name *.html -o -name *.css -o -name *.js \\\\\\))",
+      "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026 -type f -name *.py)",
+      "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026 -type f \\\\\\(-name *.jsx -o -name *.tsx -o -name *.json -o -name *.yml -o -name *.yaml \\\\\\))",
+      "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026 -type f -name *.cpp -o -name *.hpp -o -name *.h)",
+      "Bash(grep -r \"display\\\\|screen\\\\|render\\\\|GUI\\\\|interface\" /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026/Software --include=*.py --include=*.cpp --include=*.hpp --include=*.h)"
     ]
   }
 }

@@ -9,10 +9,12 @@ CanSat 2026 Ground Station Dashboard
 =====================================
 Real-time telemetry display with graphing and CSV recording.
 
-Packet format from receiver (USB serial):
+Packet format (USB serial):
   $CANSAT,<ms>,<temp>,<press>,<hum>,<gas>,<lat_e7>,<lon_e7>,<alt_mm>,<roll>,<pitch>,<yaw>
+  $FREQ,<freq_mhz>,<channel>
 """
 
+import platform
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import serial
@@ -20,6 +22,7 @@ import serial.tools.list_ports
 import threading
 import csv
 import os
+import time
 from datetime import datetime
 from collections import deque
 
@@ -28,67 +31,61 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-# ── Data config ──────────────────────────────────────────────────────────────
+# ── Platform font helpers ─────────────────────────────────────────────────────
+_IS_MAC = platform.system() == "Darwin"
+_SANS   = "Helvetica Neue" if _IS_MAC else "Segoe UI"
+_MONO   = "Menlo"          if _IS_MAC else "Consolas"
 
+FONT_LABEL    = (_SANS, 10)
+FONT_LABEL_SM = (_SANS, 9)
+FONT_LABEL_B  = (_SANS, 10, "bold")
+FONT_VALUE    = (_MONO, 14, "bold")
+FONT_VALUE_SM = (_MONO, 11, "bold")
+FONT_SECTION  = (_SANS, 9,  "bold")
+FONT_TITLE    = (_SANS, 13, "bold")
+FONT_FREQ     = (_MONO, 18, "bold")
+FONT_CONSOLE  = (_MONO, 9)
+
+# ── Colour palette ────────────────────────────────────────────────────────────
+BG      = "#0d1117"   # root window background
+CARD    = "#161b22"   # panel / card background
+CARD2   = "#1c2128"   # inset / toolbar background
+BORDER  = "#30363d"   # borders, dividers
+TEXT    = "#e6edf3"   # primary text
+SUBTEXT = "#8b949e"   # muted labels
+GREEN   = "#3fb950"   # good / connected
+RED     = "#f85149"   # error / disconnected
+ORANGE  = "#f0883e"   # radio / accent
+BLUE    = "#58a6ff"   # environmental
+PURPLE  = "#bc8cff"   # attitude
+YELLOW  = "#e3b341"   # yaw
+PINK    = "#f778ba"   # gas resistance
+TEAL    = "#39c5cf"   # pitch
+
+GRAPH_BG   = "#0d1117"
+GRAPH_CARD = "#161b22"
+
+# ── Data config ────────────────────────────────────────────────────────────────
 FIELDS = [
     "timestamp_ms", "temperature", "pressure", "humidity", "gas_resistance",
     "lat_e7", "lon_e7", "alt_mm", "roll", "pitch", "yaw",
 ]
 
 GRAPH_GROUPS = [
-    {
-        "title": "Temperature (C)",
-        "fields": ["temperature"],
-        "colors": ["#e74c3c"],
-        "ylabel": "C",
-        "ylim": (-20, 60),
-    },
-    {
-        "title": "Pressure (hPa)",
-        "fields": ["pressure"],
-        "colors": ["#3498db"],
-        "ylabel": "hPa",
-        "ylim": (950, 1050),
-    },
-    {
-        "title": "Humidity (%)",
-        "fields": ["humidity"],
-        "colors": ["#2ecc71"],
-        "ylabel": "%",
-        "ylim": (0, 100),
-    },
-    {
-        "title": "Altitude (m)",
-        "fields": ["alt_mm"],
-        "colors": ["#9b59b6"],
-        "ylabel": "m",
-        "scale": [("alt_mm", 0.001)],  # mm -> m
-        "ylim": (-50, 1000),
-    },
-    {
-        "title": "Orientation (deg)",
-        "fields": ["roll", "pitch", "yaw"],
-        "colors": ["#e67e22", "#1abc9c", "#f1c40f"],
-        "ylabel": "deg",
-        "ylim": (-180, 180),
-    },
-    {
-        "title": "Gas Resistance (kOhm)",
-        "fields": ["gas_resistance"],
-        "colors": ["#e84393"],
-        "ylabel": "kOhm",
-        "scale": [("gas_resistance", 0.001)],  # ohm -> kOhm
-        "ylim": (0, 500),
-    },
+    {"title": "Temperature",    "fields": ["temperature"],          "colors": [RED],                    "ylabel": "°C",  "ylim": (-20, 60)},
+    {"title": "Pressure",       "fields": ["pressure"],             "colors": [BLUE],                   "ylabel": "hPa", "ylim": (950, 1050)},
+    {"title": "Humidity",       "fields": ["humidity"],             "colors": [GREEN],                  "ylabel": "%",   "ylim": (0, 100)},
+    {"title": "Altitude",       "fields": ["alt_mm"],               "colors": [PURPLE],                 "ylabel": "m",   "scale": [("alt_mm", 0.001)],          "ylim": (-50, 1000)},
+    {"title": "Orientation",    "fields": ["roll", "pitch", "yaw"],"colors": [ORANGE, TEAL, YELLOW],   "ylabel": "deg", "ylim": (-180, 180)},
+    {"title": "Gas Resistance", "fields": ["gas_resistance"],       "colors": [PINK],                   "ylabel": "kΩ",  "scale": [("gas_resistance", 0.001)],  "ylim": (0, 500)},
 ]
 
-TEMP_OFFSET_C = -6.41  # PCB self-heating correction
+TEMP_OFFSET_C = -6.41
+MAX_POINTS    = 300
+REFRESH_MS    = 200
 
-MAX_POINTS = 300  # rolling window for graphs
-REFRESH_MS = 200  # graph refresh interval
 
-
-# ── Packet parsing ───────────────────────────────────────────────────────────
+# ── Packet parsing ─────────────────────────────────────────────────────────────
 
 def parse_packet(line: str) -> dict | None:
     """Parse a $CANSAT CSV line into a dict. Returns None on failure."""
@@ -99,176 +96,425 @@ def parse_packet(line: str) -> dict | None:
     if len(parts) != len(FIELDS):
         return None
     try:
-        values = {}
-        for i, name in enumerate(FIELDS):
-            values[name] = float(parts[i])
-        return values
+        return {name: float(parts[i]) for i, name in enumerate(FIELDS)}
     except ValueError:
         return None
 
 
-# ── Main application ─────────────────────────────────────────────────────────
+def parse_freq_packet(line: str):
+    """Parse $FREQ,<mhz>,<CH65> -> (freq_mhz: float, channel: str) or None."""
+    line = line.strip()
+    if not line.startswith("$FREQ,"):
+        return None
+    parts = line[len("$FREQ,"):].split(",")
+    if len(parts) >= 2:
+        try:
+            return float(parts[0]), parts[1]
+        except ValueError:
+            pass
+    return None
+
+
+# ── Main application ───────────────────────────────────────────────────────────
 
 class GroundStationApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("CanSat 2026 Ground Station")
-        self.root.geometry("1400x900")
-        self.root.minsize(1000, 700)
+        self.root.title("CanSat 2026 — Ground Station")
+        self.root.geometry("1440x900")
+        self.root.minsize(1100, 720)
+        self.root.configure(bg=BG)
 
         # State
         self.serial_port: serial.Serial | None = None
         self.serial_thread: threading.Thread | None = None
-        self.running = False
+        self.running   = False
         self.recording = False
         self.recorded_rows: list[dict] = []
         self.packet_count = 0
         self.last_packet: dict | None = None
+        self.last_packet_time: float | None = None
+        self._overlay_blink_on = False
 
         # Rolling data for graphs
         self.time_data = deque(maxlen=MAX_POINTS)
         self.series: dict[str, deque] = {f: deque(maxlen=MAX_POINTS) for f in FIELDS}
 
+        self._apply_style()
         self._build_ui()
         self._refresh_ports()
+        self._schedule_signal_check()
 
-    # ── UI construction ──────────────────────────────────────────────────
+    # ── Theming ────────────────────────────────────────────────────────────
+
+    def _apply_style(self):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(".",                background=CARD,  foreground=TEXT,   borderwidth=0)
+        style.configure("TFrame",           background=CARD)
+        style.configure("TLabel",           background=CARD,  foreground=TEXT)
+        style.configure("TLabelframe",      background=CARD,  foreground=TEXT)
+        style.configure("TLabelframe.Label",background=CARD,  foreground=SUBTEXT, font=FONT_SECTION)
+        style.configure("TSeparator",       background=BORDER)
+        style.configure("TScrollbar",       background=CARD2, troughcolor=CARD, arrowcolor=SUBTEXT, borderwidth=0)
+
+        # Default button
+        style.configure("TButton",
+                        background=CARD2, foreground=TEXT,
+                        relief="flat", borderwidth=1, bordercolor=BORDER,
+                        focusthickness=0, padding=(10, 5), font=FONT_LABEL)
+        style.map("TButton",
+                  background=[("active", BORDER), ("pressed", BORDER)],
+                  foreground=[("active", TEXT)])
+
+        # Connect (green)
+        style.configure("Accent.TButton",
+                        background=GREEN, foreground=BG,
+                        relief="flat", borderwidth=0,
+                        focusthickness=0, padding=(10, 5), font=FONT_LABEL_B)
+        style.map("Accent.TButton",
+                  background=[("active", "#2ea043"), ("pressed", "#238636")],
+                  foreground=[("active", BG)])
+
+        # Disconnect (red)
+        style.configure("Danger.TButton",
+                        background="#2d1515", foreground=RED,
+                        relief="flat", borderwidth=1, bordercolor="#5a2020",
+                        focusthickness=0, padding=(10, 5), font=FONT_LABEL_B)
+        style.map("Danger.TButton",
+                  background=[("active", "#3d1a1a")])
+
+        # Record (orange)
+        style.configure("Record.TButton",
+                        background="#2d1f0a", foreground=ORANGE,
+                        relief="flat", borderwidth=1, bordercolor="#5a3d14",
+                        focusthickness=0, padding=(10, 5), font=FONT_LABEL_B)
+        style.map("Record.TButton",
+                  background=[("active", "#3d2a0e")])
+
+        # Combobox
+        style.configure("TCombobox",
+                        fieldbackground=CARD2, background=CARD2,
+                        foreground=TEXT, arrowcolor=SUBTEXT,
+                        selectbackground=BLUE, selectforeground=BG,
+                        padding=(4, 4))
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", CARD2)],
+                  selectbackground=[("readonly", CARD2)],
+                  selectforeground=[("readonly", TEXT)])
+
+    # ── UI construction ────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Top bar: connection + controls
-        top = ttk.Frame(self.root, padding=5)
-        top.pack(fill=tk.X)
+        self._build_toolbar()
+        self._build_main_area()
+        self._build_console()
+        self._schedule_graph_update()
 
-        ttk.Label(top, text="Port:").pack(side=tk.LEFT)
+    # ── Toolbar ────────────────────────────────────────────────────────────
+
+    def _build_toolbar(self):
+        toolbar = tk.Frame(self.root, bg=CARD2, height=56)
+        toolbar.pack(fill=tk.X, side=tk.TOP)
+        toolbar.pack_propagate(False)
+        tk.Frame(self.root, bg=BORDER, height=1).pack(fill=tk.X)
+
+        # ── Left: Logo + title ─────────────────────────────────────────────
+        logo_frame = tk.Frame(toolbar, bg=CARD2)
+        logo_frame.pack(side=tk.LEFT, padx=(16, 12), pady=8)
+        tk.Label(logo_frame, text="▲", bg=CARD2, fg=ORANGE,
+                 font=FONT_TITLE).pack(side=tk.LEFT)
+        tk.Label(logo_frame, text=" CANSAT 2026", bg=CARD2, fg=TEXT,
+                 font=FONT_TITLE).pack(side=tk.LEFT)
+
+        self._vsep(toolbar)
+
+        # ── Port + baud + connect ──────────────────────────────────────────
+        conn_frame = tk.Frame(toolbar, bg=CARD2)
+        conn_frame.pack(side=tk.LEFT, padx=4, pady=8)
+
+        tk.Label(conn_frame, text="PORT", bg=CARD2, fg=SUBTEXT,
+                 font=FONT_LABEL_SM).pack(side=tk.LEFT, padx=(0, 4))
         self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(top, textvariable=self.port_var, width=25, state="readonly")
-        self.port_combo.pack(side=tk.LEFT, padx=(2, 5))
+        self.port_combo = ttk.Combobox(conn_frame, textvariable=self.port_var,
+                                       width=18, state="readonly")
+        self.port_combo.pack(side=tk.LEFT)
 
-        ttk.Button(top, text="Refresh", command=self._refresh_ports).pack(side=tk.LEFT, padx=2)
+        ttk.Button(conn_frame, text="↺", command=self._refresh_ports,
+                   width=3).pack(side=tk.LEFT, padx=(4, 12))
 
-        ttk.Label(top, text="Baud:").pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(conn_frame, text="BAUD", bg=CARD2, fg=SUBTEXT,
+                 font=FONT_LABEL_SM).pack(side=tk.LEFT, padx=(0, 4))
         self.baud_var = tk.StringVar(value="115200")
-        ttk.Combobox(top, textvariable=self.baud_var, values=["9600", "115200"], width=8, state="readonly").pack(side=tk.LEFT, padx=2)
+        ttk.Combobox(conn_frame, textvariable=self.baud_var,
+                     values=["9600", "115200"], width=8,
+                     state="readonly").pack(side=tk.LEFT)
 
-        self.connect_btn = ttk.Button(top, text="Connect", command=self._toggle_connection)
-        self.connect_btn.pack(side=tk.LEFT, padx=10)
+        self.connect_btn = ttk.Button(conn_frame, text="Connect",
+                                      command=self._toggle_connection,
+                                      style="Accent.TButton")
+        self.connect_btn.pack(side=tk.LEFT, padx=(12, 0))
 
-        # Separator
-        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        self._vsep(toolbar)
 
-        self.record_btn = ttk.Button(top, text="Start Recording", command=self._toggle_recording, state=tk.DISABLED)
-        self.record_btn.pack(side=tk.LEFT, padx=5)
+        # ── Data controls ──────────────────────────────────────────────────
+        data_frame = tk.Frame(toolbar, bg=CARD2)
+        data_frame.pack(side=tk.LEFT, padx=4, pady=8)
 
-        self.save_btn = ttk.Button(top, text="Save CSV", command=self._save_csv, state=tk.DISABLED)
-        self.save_btn.pack(side=tk.LEFT, padx=5)
+        self.record_btn = ttk.Button(data_frame, text="⏺  Record",
+                                     command=self._toggle_recording,
+                                     style="Record.TButton", state=tk.DISABLED)
+        self.record_btn.pack(side=tk.LEFT, padx=(0, 4))
 
-        ttk.Button(top, text="Clear Graphs", command=self._clear_data).pack(side=tk.LEFT, padx=5)
+        self.save_btn = ttk.Button(data_frame, text="Save CSV",
+                                   command=self._save_csv, state=tk.DISABLED)
+        self.save_btn.pack(side=tk.LEFT, padx=(0, 4))
 
-        # Status bar (right side of top bar)
-        self.status_var = tk.StringVar(value="Disconnected")
-        ttk.Label(top, textvariable=self.status_var, foreground="gray").pack(side=tk.RIGHT, padx=5)
+        ttk.Button(data_frame, text="Clear",
+                   command=self._clear_data).pack(side=tk.LEFT)
 
-        self.pkt_count_var = tk.StringVar(value="Packets: 0")
-        ttk.Label(top, textvariable=self.pkt_count_var).pack(side=tk.RIGHT, padx=10)
+        # ── Right: Radio freq badge + status ──────────────────────────────
+        # Status cluster (rightmost)
+        status_frame = tk.Frame(toolbar, bg=CARD2)
+        status_frame.pack(side=tk.RIGHT, padx=(0, 16), pady=8)
+
+        self.pkt_count_var = tk.StringVar(value="0 pkts")
+        tk.Label(status_frame, textvariable=self.pkt_count_var,
+                 bg=CARD2, fg=SUBTEXT, font=FONT_LABEL_SM).pack(side=tk.RIGHT, padx=(12, 0))
 
         self.rec_label_var = tk.StringVar(value="")
-        self.rec_label = ttk.Label(top, textvariable=self.rec_label_var, foreground="red")
-        self.rec_label.pack(side=tk.RIGHT, padx=5)
+        tk.Label(status_frame, textvariable=self.rec_label_var,
+                 bg=CARD2, fg=RED, font=FONT_LABEL_B).pack(side=tk.RIGHT, padx=8)
 
-        # Main area: left = graphs, right = live values
-        main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.status_dot = tk.Label(status_frame, text="●", bg=CARD2, fg=RED,
+                                   font=(_SANS, 14))
+        self.status_dot.pack(side=tk.RIGHT, padx=(0, 4))
+        self.status_var = tk.StringVar(value="Disconnected")
+        tk.Label(status_frame, textvariable=self.status_var,
+                 bg=CARD2, fg=SUBTEXT, font=FONT_LABEL_SM).pack(side=tk.RIGHT, padx=4)
 
-        # Left: graphs
-        graph_frame = ttk.Frame(main_pane)
-        main_pane.add(graph_frame, weight=4)
+        # Radio frequency badge
+        self._vsep(toolbar, right=True)
 
-        nrows = 3
-        ncols = 2
+        freq_badge = tk.Frame(toolbar, bg=CARD, padx=12, pady=4)
+        freq_badge.pack(side=tk.RIGHT, pady=6)
+        # small "RF" tag
+        tk.Label(freq_badge, text="RF", bg=CARD, fg=SUBTEXT,
+                 font=FONT_SECTION).pack(side=tk.LEFT, padx=(0, 8))
+        # large frequency readout
+        self.freq_var = tk.StringVar(value="--- MHz")
+        tk.Label(freq_badge, textvariable=self.freq_var, bg=CARD, fg=ORANGE,
+                 font=FONT_FREQ).pack(side=tk.LEFT)
+        # channel label
+        self.chan_var = tk.StringVar(value="")
+        tk.Label(freq_badge, textvariable=self.chan_var, bg=CARD, fg=SUBTEXT,
+                 font=FONT_LABEL_SM).pack(side=tk.LEFT, padx=(8, 0))
+
+        self._vsep(toolbar, right=True)
+
+    def _vsep(self, parent: tk.Frame, right: bool = False):
+        side = tk.RIGHT if right else tk.LEFT
+        tk.Frame(parent, bg=BORDER, width=1).pack(side=side, fill=tk.Y, padx=6, pady=10)
+
+    # ── Main content ───────────────────────────────────────────────────────
+
+    def _build_main_area(self):
+        content = tk.Frame(self.root, bg=BG)
+        content.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 0))
+
+        # Graphs (left, expands)
+        self.graph_outer = tk.Frame(content, bg=CARD)
+        self.graph_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
         self.fig = Figure(figsize=(10, 7), dpi=100)
-        self.fig.set_facecolor("#2b2b2b")
+        self.fig.set_facecolor(GRAPH_BG)
         self.axes = []
         self.lines = {}
+        self._build_graphs()
 
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.graph_outer)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self._build_signal_overlay()
+
+        # Divider
+        tk.Frame(content, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
+
+        # Telemetry panel (right, fixed width)
+        right_panel = tk.Frame(content, bg=CARD, width=330)
+        right_panel.pack(side=tk.RIGHT, fill=tk.Y)
+        right_panel.pack_propagate(False)
+        self._build_telemetry_panel(right_panel)
+
+    def _build_signal_overlay(self):
+        """Full-size overlay drawn on top of the graph area for warnings."""
+        self.overlay = tk.Frame(self.graph_outer, bg="#1a0000")
+        # Two lines of text: big icon/status + detail
+        self.overlay_icon  = tk.Label(self.overlay, text="⚠", bg="#1a0000", fg=RED,
+                                      font=(_SANS, 72, "bold"))
+        self.overlay_icon.pack(expand=True, pady=(60, 0))
+        self.overlay_title = tk.Label(self.overlay, text="NOT CONNECTED",
+                                      bg="#1a0000", fg=RED,
+                                      font=(_SANS, 36, "bold"))
+        self.overlay_title.pack()
+        self.overlay_sub   = tk.Label(self.overlay, text="Select a port and click Connect",
+                                      bg="#1a0000", fg="#cc4444",
+                                      font=(_SANS, 14))
+        self.overlay_sub.pack(pady=(8, 0))
+        # Show it immediately (disconnected at startup)
+        self.overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    def _build_graphs(self):
         for idx, group in enumerate(GRAPH_GROUPS):
-            ax = self.fig.add_subplot(nrows, ncols, idx + 1)
-            ax.set_facecolor("#1e1e1e")
-            ax.set_title(group["title"], color="white", fontsize=10, pad=4)
-            ax.set_ylabel(group["ylabel"], color="white", fontsize=8)
-            ax.tick_params(colors="white", labelsize=7)
+            ax = self.fig.add_subplot(3, 2, idx + 1)
+            ax.set_facecolor(GRAPH_CARD)
+            ax.set_title(group["title"], color=TEXT, fontsize=9, pad=4)
+            ax.set_ylabel(group["ylabel"], color=SUBTEXT, fontsize=8)
+            ax.tick_params(colors=SUBTEXT, labelsize=7)
             for spine in ax.spines.values():
-                spine.set_color("#555")
-            ax.grid(True, color="#333", linewidth=0.5)
+                spine.set_color(BORDER)
+            ax.grid(True, color=BORDER, linewidth=0.5, alpha=0.8)
             if "ylim" in group:
                 ax.set_ylim(*group["ylim"])
 
             group_lines = []
             for fi, field in enumerate(group["fields"]):
-                (line,) = ax.plot([], [], color=group["colors"][fi], linewidth=1.2, label=field)
+                (line,) = ax.plot([], [], color=group["colors"][fi],
+                                  linewidth=1.5, label=field)
                 group_lines.append((field, line))
             if len(group["fields"]) > 1:
-                ax.legend(fontsize=7, loc="upper left", facecolor="#2b2b2b", edgecolor="#555", labelcolor="white")
+                ax.legend(fontsize=7, loc="upper left",
+                          facecolor=CARD, edgecolor=BORDER,
+                          labelcolor=TEXT, framealpha=0.9)
             self.lines[idx] = group_lines
             self.axes.append(ax)
 
-        self.fig.tight_layout(pad=2.0)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.fig.tight_layout(pad=2.5)
 
-        # Right: live values panel
-        values_frame = ttk.LabelFrame(main_pane, text="Live Telemetry", padding=10)
-        main_pane.add(values_frame, weight=1)
+    # ── Telemetry panel ────────────────────────────────────────────────────
 
-        self.value_labels: dict[str, ttk.Label] = {}
-        display_fields = [
-            ("Timestamp", "timestamp_ms", "ms"),
-            ("Temperature", "temperature", "C"),
-            ("Pressure", "pressure", "hPa"),
-            ("Humidity", "humidity", "%"),
-            ("Gas Resistance", "gas_resistance", "ohm"),
-            ("Latitude", "lat_e7", "e-7 deg"),
-            ("Longitude", "lon_e7", "e-7 deg"),
-            ("Altitude", "alt_mm", "mm"),
-            ("Roll", "roll", "deg"),
+    def _build_telemetry_panel(self, parent: tk.Frame):
+        self.value_labels: dict[str, tk.Label] = {}
+
+        # Header row
+        hdr = tk.Frame(parent, bg=CARD)
+        hdr.pack(fill=tk.X, padx=12, pady=(10, 6))
+        tk.Label(hdr, text="LIVE TELEMETRY", bg=CARD, fg=TEXT,
+                 font=FONT_SECTION).pack(side=tk.LEFT)
+        self.last_pkt_var = tk.StringVar(value="")
+        tk.Label(hdr, textvariable=self.last_pkt_var, bg=CARD,
+                 fg=SUBTEXT, font=FONT_LABEL_SM).pack(side=tk.RIGHT)
+
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X)
+
+        # ── Uptime ────────────────────────────────────────────────────────
+        uptime_row = tk.Frame(parent, bg=CARD)
+        uptime_row.pack(fill=tk.X, padx=12, pady=(8, 4))
+        tk.Label(uptime_row, text="Uptime", bg=CARD, fg=SUBTEXT,
+                 font=FONT_LABEL_SM, width=10, anchor="w").pack(side=tk.LEFT)
+        self.uptime_var = tk.StringVar(value="--:--")
+        tk.Label(uptime_row, textvariable=self.uptime_var, bg=CARD, fg=TEXT,
+                 font=FONT_VALUE_SM, anchor="e").pack(side=tk.RIGHT)
+
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, padx=12, pady=(6, 2))
+
+        # ── Environmental ─────────────────────────────────────────────────
+        self._section_header(parent, "Environmental", BLUE)
+        for label, field, unit in [
+            ("Temperature", "temperature",   "°C"),
+            ("Pressure",    "pressure",      "hPa"),
+            ("Humidity",    "humidity",      "%"),
+            ("Gas Resist.", "gas_resistance","kΩ"),
+        ]:
+            self._value_row(parent, label, field, unit)
+
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, padx=12, pady=(6, 2))
+
+        # ── Navigation ────────────────────────────────────────────────────
+        self._section_header(parent, "Navigation", GREEN)
+        for label, field, unit in [
+            ("Latitude",  "lat_e7", "×10⁻⁷°"),
+            ("Longitude", "lon_e7", "×10⁻⁷°"),
+            ("Altitude",  "alt_mm", "m"),
+        ]:
+            self._value_row(parent, label, field, unit)
+
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, padx=12, pady=(6, 2))
+
+        # ── Attitude ──────────────────────────────────────────────────────
+        self._section_header(parent, "Attitude", PURPLE)
+        for label, field, unit in [
+            ("Roll",  "roll",  "deg"),
             ("Pitch", "pitch", "deg"),
-            ("Yaw", "yaw", "deg"),
-        ]
+            ("Yaw",   "yaw",   "deg"),
+        ]:
+            self._value_row(parent, label, field, unit)
 
-        for i, (label_text, field, unit) in enumerate(display_fields):
-            row_frame = ttk.Frame(values_frame)
-            row_frame.pack(fill=tk.X, pady=2)
-            ttk.Label(row_frame, text=f"{label_text}:", width=16, anchor="w").pack(side=tk.LEFT)
-            val_label = ttk.Label(row_frame, text="---", width=14, anchor="e", font=("Courier", 12))
-            val_label.pack(side=tk.LEFT, padx=(0, 4))
-            ttk.Label(row_frame, text=unit, foreground="gray").pack(side=tk.LEFT)
-            self.value_labels[field] = val_label
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, padx=12, pady=(6, 2))
 
-        # Raw packet display at bottom of values panel
-        ttk.Separator(values_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
-        ttk.Label(values_frame, text="Last Raw Packet:").pack(anchor="w")
+        # ── Last raw packet ───────────────────────────────────────────────
+        raw_outer = tk.Frame(parent, bg=CARD)
+        raw_outer.pack(fill=tk.X, padx=12, pady=(4, 8))
+        tk.Label(raw_outer, text="LAST PACKET", bg=CARD, fg=SUBTEXT,
+                 font=FONT_SECTION).pack(anchor="w")
         self.raw_var = tk.StringVar(value="---")
-        raw_label = ttk.Label(values_frame, textvariable=self.raw_var, wraplength=280, foreground="gray",
-                              font=("Courier", 9))
-        raw_label.pack(anchor="w", pady=2)
+        tk.Label(raw_outer, textvariable=self.raw_var, bg=CARD, fg=SUBTEXT,
+                 font=FONT_CONSOLE, wraplength=295, anchor="w",
+                 justify="left").pack(anchor="w", pady=(2, 0))
 
-        # Console log at the very bottom
-        console_frame = ttk.LabelFrame(self.root, text="Serial Log", padding=2)
-        console_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+    def _section_header(self, parent: tk.Frame, title: str, color: str):
+        f = tk.Frame(parent, bg=CARD)
+        f.pack(fill=tk.X, padx=8, pady=(4, 2))
+        tk.Frame(f, bg=color, width=3).pack(side=tk.LEFT, fill=tk.Y)
+        tk.Label(f, text=f"  {title.upper()}", bg=CARD, fg=color,
+                 font=FONT_SECTION).pack(side=tk.LEFT)
 
-        self.console = tk.Text(console_frame, height=4, bg="#1e1e1e", fg="#aaa", font=("Courier", 9),
-                               state=tk.DISABLED, wrap=tk.WORD)
-        self.console.pack(fill=tk.X)
+    def _value_row(self, parent: tk.Frame, label: str, field: str, unit: str):
+        f = tk.Frame(parent, bg=CARD)
+        f.pack(fill=tk.X, padx=14, pady=2)
+        tk.Label(f, text=label, bg=CARD, fg=SUBTEXT,
+                 font=FONT_LABEL, width=12, anchor="w").pack(side=tk.LEFT)
+        val_lbl = tk.Label(f, text="---", bg=CARD, fg=TEXT,
+                           font=FONT_VALUE, width=9, anchor="e")
+        val_lbl.pack(side=tk.LEFT)
+        tk.Label(f, text=f" {unit}", bg=CARD, fg=SUBTEXT,
+                 font=FONT_LABEL_SM, width=8, anchor="w").pack(side=tk.LEFT)
+        self.value_labels[field] = val_lbl
 
-        # Start graph refresh loop
-        self._schedule_graph_update()
+    # ── Console bar ────────────────────────────────────────────────────────
 
-    # ── Port management ──────────────────────────────────────────────────
+    def _build_console(self):
+        tk.Frame(self.root, bg=BORDER, height=1).pack(fill=tk.X)
+        console_outer = tk.Frame(self.root, bg=CARD2)
+        console_outer.pack(fill=tk.X, side=tk.BOTTOM)
+
+        hdr = tk.Frame(console_outer, bg=CARD2)
+        hdr.pack(fill=tk.X, padx=10, pady=(4, 0))
+        tk.Label(hdr, text="SERIAL LOG", bg=CARD2, fg=SUBTEXT,
+                 font=FONT_SECTION).pack(side=tk.LEFT)
+        ttk.Button(hdr, text="Clear",
+                   command=self._clear_log).pack(side=tk.RIGHT)
+
+        self.console = tk.Text(
+            console_outer, height=4,
+            bg=CARD2, fg=SUBTEXT,
+            font=FONT_CONSOLE, state=tk.DISABLED, wrap=tk.WORD,
+            insertbackground=TEXT, selectbackground=BORDER,
+            relief="flat", borderwidth=0,
+        )
+        self.console.pack(fill=tk.X, padx=10, pady=(2, 6))
+
+    # ── Port management ────────────────────────────────────────────────────
 
     def _refresh_ports(self):
         ports = serial.tools.list_ports.comports()
-        port_names = [p.device for p in ports]
-        self.port_combo["values"] = port_names
-        if port_names:
+        names = [p.device for p in ports]
+        self.port_combo["values"] = names
+        if names:
             self.port_combo.current(0)
 
     def _toggle_connection(self):
@@ -290,9 +536,10 @@ class GroundStationApp:
             return
 
         self.running = True
-        self.connect_btn.config(text="Disconnect")
+        self.connect_btn.config(text="Disconnect", style="Danger.TButton")
         self.record_btn.config(state=tk.NORMAL)
-        self.status_var.set(f"Connected: {port} @ {baud}")
+        self.status_var.set(f"{port}  @{baud}")
+        self.status_dot.config(fg=GREEN)
         self._log(f"Connected to {port} at {baud} baud")
 
         self.serial_thread = threading.Thread(target=self._serial_reader, daemon=True)
@@ -300,17 +547,19 @@ class GroundStationApp:
 
     def _disconnect(self):
         self.running = False
+        self.last_packet_time = None
         if self.recording:
             self._toggle_recording()
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
         self.serial_port = None
-        self.connect_btn.config(text="Connect")
+        self.connect_btn.config(text="Connect", style="Accent.TButton")
         self.record_btn.config(state=tk.DISABLED)
         self.status_var.set("Disconnected")
+        self.status_dot.config(fg=RED)
         self._log("Disconnected")
 
-    # ── Serial reader thread ─────────────────────────────────────────────
+    # ── Serial reader thread ───────────────────────────────────────────────
 
     def _serial_reader(self):
         while self.running and self.serial_port and self.serial_port.is_open:
@@ -322,17 +571,19 @@ class GroundStationApp:
                 if not line:
                     continue
 
-                # Log non-packet lines (debug output from receiver)
-                if not line.startswith("$CANSAT"):
+                if line.startswith("$CANSAT"):
+                    data = parse_packet(line)
+                    if data is None:
+                        self.root.after(0, self._log, f"Bad packet: {line}")
+                    else:
+                        self.root.after(0, self._on_packet, data, line)
+                elif line.startswith("$FREQ"):
+                    info = parse_freq_packet(line)
+                    if info:
+                        self.root.after(0, self._on_freq_packet, *info)
                     self.root.after(0, self._log, line)
-                    continue
-
-                data = parse_packet(line)
-                if data is None:
-                    self.root.after(0, self._log, f"Bad packet: {line}")
-                    continue
-
-                self.root.after(0, self._on_packet, data, line)
+                else:
+                    self.root.after(0, self._log, line)
 
             except serial.SerialException:
                 self.root.after(0, self._disconnect)
@@ -340,49 +591,105 @@ class GroundStationApp:
             except Exception as e:
                 self.root.after(0, self._log, f"Error: {e}")
 
-    # ── Packet handling (runs on main thread) ────────────────────────────
+    # ── Packet handlers (main thread) ──────────────────────────────────────
+
+    def _on_freq_packet(self, freq_mhz: float, channel: str):
+        self.freq_var.set(f"{freq_mhz:.3f} MHz")
+        self.chan_var.set(channel)
 
     def _on_packet(self, data: dict, raw_line: str):
         self.packet_count += 1
         self.last_packet = data
-        self.pkt_count_var.set(f"Packets: {self.packet_count}")
+        self.last_packet_time = time.monotonic()
+        self.pkt_count_var.set(f"{self.packet_count} pkts")
         self.raw_var.set(raw_line)
+        self.last_pkt_var.set(datetime.now().strftime("%H:%M:%S"))
 
-        # Apply temperature offset correction
         if data["temperature"] > -999:
             data["temperature"] += TEMP_OFFSET_C
 
-        # Append to rolling buffers
-        t = data["timestamp_ms"] / 1000.0  # seconds
+        t = data["timestamp_ms"] / 1000.0
         self.time_data.append(t)
         for field in FIELDS:
             self.series[field].append(data[field])
 
-        # Update live value labels
-        for field, label in self.value_labels.items():
-            val = data.get(field)
-            if val is not None:
-                if field == "timestamp_ms":
-                    label.config(text=f"{int(val)}")
-                elif field in ("lat_e7", "lon_e7"):
-                    label.config(text=f"{int(val)}")
-                elif field == "alt_mm":
-                    label.config(text=f"{val:.0f}")
-                elif field == "gas_resistance":
-                    label.config(text=f"{val:.0f}")
-                else:
-                    label.config(text=f"{val:.2f}")
+        self.uptime_var.set(self._fmt_uptime(data["timestamp_ms"]))
 
-        # Recording
+        for field, lbl in self.value_labels.items():
+            val = data.get(field)
+            if val is None:
+                continue
+            if field in ("lat_e7", "lon_e7"):
+                lbl.config(text=f"{int(val):+d}")
+            elif field == "alt_mm":
+                lbl.config(text=f"{val * 0.001:.1f}")
+            elif field == "gas_resistance":
+                lbl.config(text=f"{val * 0.001:.1f}")
+            else:
+                lbl.config(text=f"{val:.2f}")
+
         if self.recording:
             now = datetime.now()
             row = dict(data)
             row["host_time"] = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             row["elapsed_s"] = round((now - self.record_start_time).total_seconds(), 3)
             self.recorded_rows.append(row)
-            self.rec_label_var.set(f"REC [{len(self.recorded_rows)}]")
+            self.rec_label_var.set(f"● REC  {len(self.recorded_rows)}")
 
-    # ── Graph update ─────────────────────────────────────────────────────
+    @staticmethod
+    def _fmt_uptime(ms: float) -> str:
+        s = int(ms / 1000)
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h:
+            return f"{h:02d}:{m:02d}:{sec:02d}"
+        return f"{m:02d}:{sec:02d}"
+
+    # ── Signal status overlay ──────────────────────────────────────────────
+
+    NO_DATA_TIMEOUT = 5  # seconds before "NO SIGNAL" warning
+
+    def _schedule_signal_check(self):
+        self._check_signal_status()
+        self.root.after(500, self._schedule_signal_check)
+
+    def _check_signal_status(self):
+        if not self.running:
+            self._show_overlay("NOT CONNECTED", "Select a port and click Connect",
+                               icon="⚡", blink=False)
+            return
+
+        if self.last_packet_time is None:
+            self._show_overlay("WAITING FOR DATA", "Connected — no packets received yet",
+                               icon="📡", blink=True)
+            return
+
+        elapsed = time.monotonic() - self.last_packet_time
+        if elapsed > self.NO_DATA_TIMEOUT:
+            self._show_overlay(
+                "NO SIGNAL",
+                f"Last packet  {elapsed:.0f}s ago",
+                icon="✕", blink=True,
+            )
+        else:
+            self._hide_overlay()
+
+    def _show_overlay(self, title: str, subtitle: str, icon: str = "⚠", blink: bool = False):
+        self._overlay_blink_on = not self._overlay_blink_on
+        bg = "#2a0000" if (blink and self._overlay_blink_on) else "#1a0000"
+        fg_main = "#ff3333" if (blink and self._overlay_blink_on) else RED
+
+        self.overlay.config(bg=bg)
+        self.overlay_icon.config(text=icon,  bg=bg, fg=fg_main)
+        self.overlay_title.config(text=title, bg=bg, fg=fg_main)
+        self.overlay_sub.config(text=subtitle, bg=bg, fg="#aa3333" if blink and self._overlay_blink_on else "#cc4444")
+        self.overlay.lift()
+        self.overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    def _hide_overlay(self):
+        self.overlay.place_forget()
+
+    # ── Graph update ───────────────────────────────────────────────────────
 
     def _schedule_graph_update(self):
         self._update_graphs()
@@ -391,49 +698,41 @@ class GroundStationApp:
     def _update_graphs(self):
         if not self.time_data:
             return
-
         t = list(self.time_data)
-
         for idx, group in enumerate(GRAPH_GROUPS):
             ax = self.axes[idx]
-            scale_map = {}
-            if "scale" in group:
-                scale_map = {s[0]: s[1] for s in group["scale"]}
-
+            scale_map = {s[0]: s[1] for s in group.get("scale", [])}
             for field, line in self.lines[idx]:
                 y = list(self.series[field])
                 if field in scale_map:
                     y = [v * scale_map[field] for v in y]
                 line.set_data(t[:len(y)], y)
-
             if t:
                 ax.set_xlim(t[0], t[-1] if t[-1] > t[0] else t[0] + 1)
-
         self.canvas.draw_idle()
 
-    # ── Recording ────────────────────────────────────────────────────────
+    # ── Recording ──────────────────────────────────────────────────────────
 
     def _toggle_recording(self):
         if self.recording:
             self.recording = False
-            self.record_btn.config(text="Start Recording")
+            self.record_btn.config(text="⏺  Record", style="Record.TButton")
             self.save_btn.config(state=tk.NORMAL if self.recorded_rows else tk.DISABLED)
-            self.rec_label_var.set(f"Stopped [{len(self.recorded_rows)} rows]")
-            self._log(f"Recording stopped: {len(self.recorded_rows)} rows captured")
+            self.rec_label_var.set(f"✓ {len(self.recorded_rows)} rows")
+            self._log(f"Recording stopped — {len(self.recorded_rows)} rows captured")
         else:
             self.recorded_rows.clear()
             self.record_start_time = datetime.now()
             self.recording = True
-            self.record_btn.config(text="Stop Recording")
+            self.record_btn.config(text="⏹  Stop", style="Danger.TButton")
             self.save_btn.config(state=tk.DISABLED)
-            self.rec_label_var.set("REC [0]")
+            self.rec_label_var.set("● REC  0")
             self._log("Recording started")
 
     def _save_csv(self):
         if not self.recorded_rows:
             messagebox.showinfo("No Data", "No recorded data to save.")
             return
-
         default_name = f"cansat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         filepath = filedialog.asksaveasfilename(
             defaultextension=".csv",
@@ -442,35 +741,38 @@ class GroundStationApp:
         )
         if not filepath:
             return
-
         try:
             with open(filepath, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=["host_time", "elapsed_s"] + FIELDS)
                 writer.writeheader()
                 writer.writerows(self.recorded_rows)
-            self._log(f"Saved {len(self.recorded_rows)} rows to {os.path.basename(filepath)}")
+            self._log(f"Saved {len(self.recorded_rows)} rows → {os.path.basename(filepath)}")
             messagebox.showinfo("Saved", f"Data saved to:\n{filepath}")
         except OSError as e:
             messagebox.showerror("Save Error", str(e))
 
-    # ── Utilities ────────────────────────────────────────────────────────
+    # ── Utilities ──────────────────────────────────────────────────────────
 
     def _clear_data(self):
         self.time_data.clear()
         for d in self.series.values():
             d.clear()
         self.packet_count = 0
-        self.pkt_count_var.set("Packets: 0")
+        self.pkt_count_var.set("0 pkts")
         self._log("Graphs cleared")
+
+    def _clear_log(self):
+        self.console.config(state=tk.NORMAL)
+        self.console.delete("1.0", tk.END)
+        self.console.config(state=tk.DISABLED)
 
     def _log(self, msg: str):
         self.console.config(state=tk.NORMAL)
-        self.console.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        self.console.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}]  {msg}\n")
         self.console.see(tk.END)
-        # Keep log from growing too large
         lines = int(self.console.index("end-1c").split(".")[0])
         if lines > 200:
-            self.console.delete("1.0", "100.0")
+            self.console.delete("1.0", "50.0")
         self.console.config(state=tk.DISABLED)
 
     def on_close(self):
@@ -480,7 +782,7 @@ class GroundStationApp:
         self.root.destroy()
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
     root = tk.Tk()

@@ -28,6 +28,10 @@ static constexpr uint I2C0_SCL = 5;
 // ── Calibration ────────────────────────────────────────────────────────────
 static constexpr float TEMP_OFFSET_C = -6.51f; // corrects for PCB self-heating
 
+// ── Radio frequency ────────────────────────────────────────────────────────
+static constexpr uint E220_CHANNEL  = 65;
+static constexpr float   E220_FREQ_MHZ = 850.125f + E220_CHANNEL; // 915.125 MHz
+
 // ── Timing ─────────────────────────────────────────────────────────────────
 static constexpr uint32_t LOOP_PERIOD_MS  = 1000; // 1 Hz telemetry
 static constexpr uint32_t WATCHDOG_MS     = 2000; // reboot if loop hangs
@@ -103,6 +107,14 @@ int main() {
 
     // --- Peripherals
     radio.init();
+
+    printf("[E220] TX frequency: %.3f MHz (channel %u)\n", (double)E220_FREQ_MHZ, E220_CHANNEL);
+    {
+        char freq_msg[48];
+        int n = snprintf(freq_msg, sizeof(freq_msg), "$FREQ,%.3f,CH%u\r\n", (double)E220_FREQ_MHZ, E220_CHANNEL);
+        radio.transmit(reinterpret_cast<uint8_t*>(freq_msg), (size_t)n);
+    }
+
     fc.init();
 
     // --- BME680
@@ -123,9 +135,11 @@ int main() {
     watchdog_enable(WATCHDOG_MS, true /*pause on debug*/);
 
     // ── Main loop (1 Hz) ───────────────────────────────────────────────────
+    uint32_t loop_count = 0;
     while (true) {
         absolute_time_t loop_start = get_absolute_time();
         watchdog_update();
+        ++loop_count;
 
         // 1. Toggle LED to show life
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
@@ -151,7 +165,18 @@ int main() {
         // 6. Print to USB (debug)
         printf("%s", packet);
 
-        // 7. Transmit via E220 and update NeoPixel status
+        // 7. Re-broadcast frequency packet every 10 loops so the ground station
+        //    can pick it up even if it connects after boot
+        if (loop_count % 10 == 1) {
+            char freq_msg[48];
+            int fn = snprintf(freq_msg, sizeof(freq_msg),
+                              "$FREQ,%.3f,CH%u\r\n",
+                              (double)E220_FREQ_MHZ, E220_CHANNEL);
+            radio.transmit(reinterpret_cast<uint8_t*>(freq_msg), (size_t)fn);
+            watchdog_update();
+        }
+
+        // 9. Transmit telemetry via E220 and update NeoPixel status
         bool radio_ok = true;
         if (plen > 0) {
             radio_ok = radio.transmit(reinterpret_cast<uint8_t*>(packet), (size_t)plen);
@@ -170,7 +195,7 @@ int main() {
 
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
 
-        // 8. Pace loop to ~1 Hz, continuing to drain FC data while waiting
+        // 10. Pace loop to ~1 Hz, continuing to drain FC data while waiting
         int64_t elapsed = absolute_time_diff_us(loop_start, get_absolute_time());
         int64_t remaining_us = (int64_t)(LOOP_PERIOD_MS * 1000LL) - elapsed;
         while (remaining_us > 0) {
