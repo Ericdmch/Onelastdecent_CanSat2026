@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import serial; import matplotlib; print\\(''pyserial:'', serial.__version__\\); print\\(''matplotlib:'', matplotlib.__version__\\)\")",
+      "Bash(python3 -c \"import py_compile; py_compile.compile\\(''ground_station.py'', doraise=True\\); print\\(''Syntax OK''\\)\")"
+    ]
+  }
+}
