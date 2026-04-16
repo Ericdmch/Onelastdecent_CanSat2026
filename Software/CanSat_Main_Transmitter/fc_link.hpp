@@ -32,7 +32,13 @@ public:
     // Call frequently in main loop; returns true when new data was parsed
     bool update();
 
+    // Send a named float value to ArduPilot for DataFlash logging
+    void send_named_float(uint32_t time_ms, const char* name, float value);
+
     const FCData& data() const { return data_; }
+    uint32_t bytes_received() const { return bytes_rx_; }
+    uint32_t stx_v1_count()   const { return stx_v1_; }
+    uint32_t stx_v2_count()   const { return stx_v2_; }
 
 private:
     FCData data_{};
@@ -43,6 +49,9 @@ private:
         PAYLOAD, GOT_CKA
     };
 
+    uint32_t bytes_rx_ = 0;
+    uint32_t stx_v1_  = 0;
+    uint32_t stx_v2_  = 0;
     State   state_  = State::IDLE;
     uint8_t payload_len_  = 0;
     uint8_t msg_id_       = 0;

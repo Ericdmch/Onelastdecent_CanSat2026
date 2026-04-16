@@ -26,13 +26,13 @@ void FCLink::init() {
     uart_set_fifo_enabled(FC_UART, true);
 }
 
-void FCLink::crc_init() { crc_a_ = 0; crc_b_ = 0; }
+void FCLink::crc_init() { crc_a_ = 0xFF; crc_b_ = 0xFF; }
 
 void FCLink::crc_update(uint8_t b) {
     uint8_t tmp = b ^ crc_a_;
-    tmp ^= (tmp << 4);
-    crc_a_ = (crc_b_ ^ (tmp >> 3) ^ (tmp << 4));
-    crc_b_ = tmp;
+    tmp ^= (uint8_t)(tmp << 4);
+    crc_a_ = crc_b_ ^ (uint8_t)(tmp << 3) ^ (tmp >> 4);
+    crc_b_ = tmp ^ (tmp >> 5);
 }
 
 void FCLink::reset_state() {
@@ -88,6 +88,9 @@ bool FCLink::update() {
     // Drain all available bytes
     while (uart_is_readable(FC_UART)) {
         uint8_t b = uart_getc(FC_UART);
+        bytes_rx_++;
+        if (b == 0xFE) stx_v1_++;
+        if (b == 0xFD) stx_v2_++;
 
         // Inline state machine (simpler than the method above for two-byte CRC)
         switch (state_) {
@@ -163,6 +166,44 @@ void FCLink::parse_global_pos() {
     data_.alt_mm  = read_i32(payload_ + 12);
     data_.rel_alt = (int16_t)(read_i32(payload_ + 16) / 10); // mm→cm
     data_.gps_valid = true;
+}
+
+void FCLink::send_named_float(uint32_t time_ms, const char* name, float value) {
+    // MAVLink v1 NAMED_VALUE_FLOAT (msg ID 251, CRC_EXTRA 170)
+    // Payload layout: time_boot_ms(u32,4) + value(f32,4) + name(char[10]) = 18 bytes
+    static uint8_t tx_seq = 0;
+
+    uint8_t frame[26];
+    frame[0] = 0xFE; // STX
+    frame[1] = 18;   // payload length
+    frame[2] = tx_seq++;
+    frame[3] = 1;    // system id (companion computer)
+    frame[4] = 1;    // component id
+    frame[5] = 251;  // NAMED_VALUE_FLOAT
+
+    memcpy(frame + 6,  &time_ms, 4);
+    memcpy(frame + 10, &value,   4);
+    memset(frame + 14, 0,        10);
+    strncpy(reinterpret_cast<char*>(frame + 14), name, 10);
+
+    // X.25 CRC over bytes[1..23] then CRC_EXTRA=170
+    uint8_t ca = 0xFF, cb = 0xFF;
+    for (int i = 1; i <= 23; i++) {
+        uint8_t tmp = frame[i] ^ ca;
+        tmp ^= (uint8_t)(tmp << 4);
+        ca = cb ^ (uint8_t)(tmp << 3) ^ (tmp >> 4);
+        cb = tmp ^ (tmp >> 5);
+    }
+    {
+        uint8_t tmp = 170 ^ ca; // CRC_EXTRA for msg 251
+        tmp ^= (uint8_t)(tmp << 4);
+        ca = cb ^ (uint8_t)(tmp << 3) ^ (tmp >> 4);
+        cb = tmp ^ (tmp >> 5);
+    }
+    frame[24] = ca;
+    frame[25] = cb;
+
+    uart_write_blocking(FC_UART, frame, sizeof(frame));
 }
 
 void FCLink::parse_attitude() {

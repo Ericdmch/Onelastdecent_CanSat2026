@@ -31,6 +31,8 @@ add_executable(CanSat_Main_Reciever
     CanSat_Main_Reciever.cpp
 )
 
+pico_generate_pio_header(CanSat_Main_Reciever ${CMAKE_CURRENT_LIST_DIR}/ws2812.pio)
+
 pico_set_program_name(CanSat_Main_Reciever "CanSat_Main_Reciever")
 pico_set_program_version(CanSat_Main_Reciever "1.0")
 
@@ -47,6 +49,8 @@ target_link_libraries(CanSat_Main_Reciever
     hardware_uart
     hardware_gpio
     hardware_watchdog
+    hardware_pio
+    hardware_clocks
 )
 
 pico_add_extra_outputs(CanSat_Main_Reciever)

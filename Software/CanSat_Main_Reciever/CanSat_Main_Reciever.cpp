@@ -12,11 +12,38 @@
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
 #include "hardware/watchdog.h"
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
+#include "ws2812.pio.h"
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
-static constexpr uint LED_PIN = 25;
+static constexpr uint LED_PIN  = 25;
+
+// ── NeoPixel (WS2812) ─────────────────────────────────────────────────────
+static constexpr uint NEO_PIN  = 7;
+static PIO  neo_pio = pio0;
+static uint neo_sm  = 0;
+
+static void neo_init() {
+    uint offset = pio_add_program(neo_pio, &ws2812_program);
+    ws2812_program_init(neo_pio, neo_sm, offset, NEO_PIN, 800000.f);
+}
+
+// Send 24-bit GRB color (WS2812 expects G-R-B order in the upper 24 bits)
+static void neo_set(uint8_t r, uint8_t g, uint8_t b) {
+    uint32_t grb = ((uint32_t)g << 24) | ((uint32_t)r << 16) | ((uint32_t)b << 8);
+    pio_sm_put_blocking(neo_pio, neo_sm, grb);
+}
+
+// Brief color flash then off
+static void neo_flash(uint8_t r, uint8_t g, uint8_t b, uint32_t ms) {
+    neo_set(r, g, b);
+    sleep_ms(ms);
+    neo_set(0, 0, 0);
+}
 
 // ── E220 pin assignments ───────────────────────────────────────────────────
 #define E220_UART      uart0
@@ -32,6 +59,104 @@ static constexpr uint32_t WATCHDOG_MS = 8000;
 
 // ── Packet buffer ─────────────────────────────────────────────────────────
 static constexpr size_t BUF_SIZE = 256;
+
+// ── Ground-Station GPS (UART1, HGLRC M100-5883) ───────────────────────────
+// Wiring: GP4 → GPS RX (optional, config only),  GP5 ← GPS TX (NMEA out)
+#define GPS_UART     uart1
+static constexpr uint GPS_TX_PIN = 4;
+static constexpr uint GPS_RX_PIN = 5;
+static constexpr uint GPS_BAUD   = 9600;
+static constexpr size_t GPS_LINE_SIZE = 128;
+
+static struct {
+    int32_t  lat_e7;
+    int32_t  lon_e7;
+    int32_t  alt_mm;
+    uint16_t hdop_100;
+    uint8_t  fix;      // 0 = no fix
+} gs_gps = {};
+
+static void gps_init() {
+    uart_init(GPS_UART, GPS_BAUD);
+    gpio_set_function(GPS_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(GPS_RX_PIN, GPIO_FUNC_UART);
+    uart_set_format(GPS_UART, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(GPS_UART, true);
+    printf("[GPS] UART1 init: TX=GP%d RX=GP%d @%d baud\n",
+           GPS_TX_PIN, GPS_RX_PIN, GPS_BAUD);
+}
+
+// Convert NMEA "DDMM.MMMMM" + hemisphere to integer degrees * 1e7
+static int32_t nmea_to_e7(const char* s, char hemi) {
+    if (!s || s[0] == '\0') return 0;
+    int dot = 0;
+    while (s[dot] && s[dot] != '.') dot++;
+    if (dot < 2) return 0;
+    int deg_chars = dot - 2;
+    int32_t deg = 0;
+    for (int i = 0; i < deg_chars; i++) {
+        if (s[i] < '0' || s[i] > '9') return 0;
+        deg = deg * 10 + (s[i] - '0');
+    }
+    double min = atof(s + deg_chars);
+    double dd  = (double)deg + min / 60.0;
+    if (hemi == 'S' || hemi == 'W') dd = -dd;
+    return (int32_t)(dd * 1e7 + (dd >= 0.0 ? 0.5 : -0.5));
+}
+
+// Split a NMEA sentence in-place on ',' and '*'. Returns field count.
+static int nmea_split(char* s, char* f[], int max) {
+    int n = 0;
+    f[n++] = s;
+    while (*s && n < max) {
+        if (*s == ',' || *s == '*') { *s = '\0'; f[n++] = s + 1; }
+        s++;
+    }
+    return n;
+}
+
+// Parse any $GxGGA sentence and emit $GSPOS on USB
+static void gps_parse_line(char* line) {
+    // Accept $GPGGA, $GNGGA, $GLGGA, etc.
+    if (line[0] != '$' || line[1] != 'G' ||
+        line[3] != 'G' || line[4] != 'G' || line[5] != 'A' || line[6] != ',')
+        return;
+
+    char* f[20];
+    int n = nmea_split(line, f, 20);
+    if (n < 10) return;
+
+    // f indices: 0=id 1=time 2=lat 3=N/S 4=lon 5=E/W 6=fix 7=sats 8=hdop 9=alt
+    int fix = atoi(f[6]);
+    if (fix == 0) { gs_gps.fix = 0; return; }
+
+    gs_gps.lat_e7   = nmea_to_e7(f[2], f[3][0]);
+    gs_gps.lon_e7   = nmea_to_e7(f[4], f[5][0]);
+    gs_gps.alt_mm   = (int32_t)(atof(f[9]) * 1000.0 + 0.5);
+    gs_gps.hdop_100 = (uint16_t)(atof(f[8]) * 100.0 + 0.5);
+    gs_gps.fix      = (uint8_t)fix;
+
+    printf("$GSPOS,%ld,%ld,%ld,%u,%u\n",
+           (long)gs_gps.lat_e7, (long)gs_gps.lon_e7,
+           (long)gs_gps.alt_mm, gs_gps.hdop_100, gs_gps.fix);
+}
+
+static char gps_buf[GPS_LINE_SIZE];
+static int  gps_pos = 0;
+
+static void gps_handle_char(char c) {
+    if (c == '\n') {
+        gps_buf[gps_pos] = '\0';
+        if (gps_pos > 0 && gps_buf[0] == '$')
+            gps_parse_line(gps_buf);
+        gps_pos = 0;
+    } else if (c != '\r') {
+        if (gps_pos < (int)sizeof(gps_buf) - 1)
+            gps_buf[gps_pos++] = c;
+        else
+            gps_pos = 0;  // overflow — discard
+    }
+}
 
 // ── E220 helpers ──────────────────────────────────────────────────────────
 
@@ -303,13 +428,19 @@ int main() {
 
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
+    neo_init();
 
     if (watchdog_caused_reboot()) {
         printf("[BOOT] Watchdog reboot\n");
     }
 
-    // Configure E220 (handles all GPIO/UART init internally)
+    // Configure E220 — solid orange while busy
+    neo_set(255, 80, 0);
     e220_configure();
+    neo_set(0, 0, 0);
+
+    // Ground-station GPS
+    gps_init();
 
     watchdog_enable(WATCHDOG_MS, true);
     printf("[OK] Ground station ready — waiting for packets\n");
@@ -319,15 +450,24 @@ int main() {
     char line[BUF_SIZE];
     int  pos = 0;
     uint32_t last_heartbeat_ms = 0;
+    uint32_t last_packet_ms    = 0;
 
     while (true) {
         watchdog_update();
 
         uint32_t now = to_ms_since_boot(get_absolute_time());
-        if (now - last_heartbeat_ms >= 2000) {
+        if (now - last_heartbeat_ms >= 500) {
             printf("[SCAN] Listening for CanSat...\n");
             last_heartbeat_ms = now;
+            // Flash red when no packet received in the last 2 s
+            if (now - last_packet_ms >= 2000) {
+                neo_flash(255, 0, 0, 200);
+            }
         }
+
+        // Poll ground-station GPS (UART1)
+        while (uart_is_readable(GPS_UART))
+            gps_handle_char((char)uart_getc(GPS_UART));
 
         if (!uart_is_readable(E220_UART)) {
             sleep_us(200);
@@ -341,7 +481,9 @@ int main() {
             if (pos > 0 && line[0] == '$') {
                 // Forward complete packet to USB
                 printf("%s\n", line);
-                // Brief LED blink to show packet received
+                last_packet_ms = now;
+                // Green flash = packet received; brief LED blink as backup indicator
+                neo_flash(0, 255, 0, 15);
                 gpio_put(LED_PIN, 0);
                 sleep_ms(30);
                 gpio_put(LED_PIN, 1);

@@ -54,7 +54,10 @@ static void led_blink(uint n) {
 static int build_packet(char* buf, size_t bufsz,
                         uint32_t timestamp_ms,
                         const BME680Data& env,
-                        const FCData& fc_d)
+                        const FCData& fc_d,
+                        uint32_t fc_bytes,
+                        uint32_t stx_v1,
+                        uint32_t stx_v2)
 {
     const float R2D = 57.2957795f;
 
@@ -62,7 +65,8 @@ static int build_packet(char* buf, size_t bufsz,
         "$CANSAT,%lu,"
         "%.2f,%.2f,%.2f,%.0f,"
         "%ld,%ld,%ld,"
-        "%.1f,%.1f,%.1f"
+        "%.1f,%.1f,%.1f,"
+        "%lu,%lu,%lu"
         "\r\n",
         (unsigned long)timestamp_ms,
         // BME680
@@ -77,7 +81,11 @@ static int build_packet(char* buf, size_t bufsz,
         // Attitude (convert rad→deg)
         fc_d.att_valid ? fc_d.roll  * R2D : 0.0f,
         fc_d.att_valid ? fc_d.pitch * R2D : 0.0f,
-        fc_d.att_valid ? fc_d.yaw   * R2D : 0.0f
+        fc_d.att_valid ? fc_d.yaw   * R2D : 0.0f,
+        // Raw FC UART byte counter and MAVLink version probe (debug)
+        (unsigned long)fc_bytes,
+        (unsigned long)stx_v1,
+        (unsigned long)stx_v2
     );
     return n;
 }
@@ -160,10 +168,18 @@ int main() {
         // 4. Build telemetry string
         char packet[160];
         uint32_t ts = to_ms_since_boot(get_absolute_time());
-        int plen = build_packet(packet, sizeof(packet), ts, env, fc.data());
+        int plen = build_packet(packet, sizeof(packet), ts, env, fc.data(), fc.bytes_received(), fc.stx_v1_count(), fc.stx_v2_count());
 
         // 6. Print to USB (debug)
         printf("%s", packet);
+
+        // 6a. Log BME680 values to FC DataFlash via MAVLink NAMED_VALUE_FLOAT
+        if (env.valid) {
+            fc.send_named_float(ts, "TEMP",  env.temperature + TEMP_OFFSET_C);
+            fc.send_named_float(ts, "PRESS", env.pressure);
+            fc.send_named_float(ts, "HUMID", env.humidity);
+            fc.send_named_float(ts, "GAS",   env.gas_resistance);
+        }
 
         // 7. Re-broadcast frequency packet every 10 loops so the ground station
         //    can pick it up even if it connects after boot

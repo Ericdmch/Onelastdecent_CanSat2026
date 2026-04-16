@@ -22,7 +22,9 @@
       "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026 -type f -name *.py)",
       "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026 -type f \\\\\\(-name *.jsx -o -name *.tsx -o -name *.json -o -name *.yml -o -name *.yaml \\\\\\))",
       "Bash(find /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026 -type f -name *.cpp -o -name *.hpp -o -name *.h)",
-      "Bash(grep -r \"display\\\\|screen\\\\|render\\\\|GUI\\\\|interface\" /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026/Software --include=*.py --include=*.cpp --include=*.hpp --include=*.h)"
+      "Bash(grep -r \"display\\\\|screen\\\\|render\\\\|GUI\\\\|interface\" /Users/ericchen/Documents/GitHub/Onelastdecent_CanSat2026/Software --include=*.py --include=*.cpp --include=*.hpp --include=*.h)",
+      "WebFetch(domain:micoair.com)",
+      "WebSearch"
     ]
   }
 }
